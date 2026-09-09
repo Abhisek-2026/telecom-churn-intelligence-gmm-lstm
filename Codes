@@ -1,0 +1,328 @@
+# =====================================
+# 1. IMPORT LIBRARIES
+# =====================================
+import pandas as pd
+import numpy as np
+import random
+import tensorflow as tf
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+    accuracy_score,
+    confusion_matrix
+)
+from sklearn.decomposition import PCA
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from tensorflow.keras.callbacks import EarlyStopping
+
+
+# =====================================
+# 2. REPRODUCIBILITY
+# =====================================
+np.random.seed(42)
+tf.random.set_seed(42)
+random.seed(42)
+
+
+# =====================================
+# 3. LOAD DATA
+# =====================================
+df = pd.read_excel("D://Churn_Analysis//Churn dataset.xlsx")
+
+churn_cols = ["Mar'25","Apr'25","May'25","Jun'25","Jul'25",
+              "Aug'25","Sep'25","Oct'25","Nov'25","Dec'25","Jan'26","Feb'26","Mar'26","Apr'26","May'26", "Jun'26","July'26"]
+
+churn_matrix = df[churn_cols].fillna(0).values
+
+
+# =====================================
+# 4. SCALING
+# =====================================
+scaler = StandardScaler()
+churn_scaled = scaler.fit_transform(churn_matrix)
+
+
+# =====================================
+# 5. GMM CLUSTERING
+# =====================================
+gmm = GaussianMixture(
+    n_components=4,
+    covariance_type="full",
+    random_state=42
+)
+
+df["gmm_cluster"] = gmm.fit_predict(churn_scaled)
+gmm_probs = gmm.predict_proba(churn_scaled)
+
+
+# =====================================
+# 6. IDENTIFY HIGH-RISK CLUSTER
+# =====================================
+cluster_means = pd.DataFrame(
+    gmm.means_,
+    columns=churn_cols
+)
+
+cluster_means["mean_churn"] = cluster_means.mean(axis=1)
+high_risk_cluster = cluster_means["mean_churn"].idxmax()
+
+df["churn_probability"] = gmm_probs[:, high_risk_cluster]
+
+print("\nHigh-Risk Cluster:", high_risk_cluster)
+
+
+# =====================================
+# 7. PRINT CLUSTER CONDITIONS
+# =====================================
+print("\n===== CLUSTER CONDITIONS =====")
+
+for i in range(4):
+    mean_val = cluster_means.loc[i, "mean_churn"]
+
+    if mean_val < cluster_means["mean_churn"].quantile(0.25):
+        condition = "Stable / Low churn"
+    elif mean_val < cluster_means["mean_churn"].quantile(0.5):
+        condition = "Moderate churn"
+    elif mean_val < cluster_means["mean_churn"].quantile(0.75):
+        condition = "Rising churn"
+    else:
+        condition = "High-Risk churn"
+
+    print(f"Cluster {i} → Avg Churn: {round(mean_val,2)} → {condition}")
+
+
+# =====================================
+# 8. PCA VISUALIZATION OF 4 CLUSTERS
+# =====================================
+pca = PCA(n_components=2)
+churn_pca = pca.fit_transform(churn_scaled)
+
+plt.figure(figsize=(9,7))
+
+for cluster in range(4):
+    cluster_points = churn_pca[df["gmm_cluster"] == cluster]
+    plt.scatter(
+        cluster_points[:, 0],
+        cluster_points[:, 1],
+        label=f"Cluster {cluster}"
+    )
+
+plt.xlabel("PCA Component 1")
+plt.ylabel("PCA Component 2")
+plt.title("GMM Clusters (4 Behavioral Segments)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+# =====================================
+# INDIVIDUAL GMM CLUSTER VISUALIZATION
+# =====================================
+
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+# ---- Step 1: Apply PCA (2D projection)
+pca = PCA(n_components=2)
+churn_pca = pca.fit_transform(churn_scaled)
+
+# ---- Step 2: Plot each cluster separately
+num_clusters = 4   # Change if needed
+
+for cluster in range(num_clusters):
+    
+    plt.figure(figsize=(8,6))
+    
+    cluster_points = churn_pca[df["gmm_cluster"] == cluster]
+    
+    plt.scatter(
+        cluster_points[:, 0],
+        cluster_points[:, 1]
+    )
+    
+    plt.xlabel("PCA Component 1")
+    plt.ylabel("PCA Component 2")
+    plt.title(f"GMM Cluster {cluster} Distribution")
+    plt.grid(True)
+    plt.show()
+
+
+# =====================================
+# 9. CLUSTER-WISE LSTM TRAINING
+# =====================================
+cluster_models = {}
+cluster_metrics = {}
+
+for cluster in range(4):
+
+    print(f"\n===== Training LSTM for Cluster {cluster} =====")
+
+    cluster_data = churn_scaled[df["gmm_cluster"] == cluster]
+
+    if len(cluster_data) < 30:
+        print("Not enough samples. Skipping.")
+        continue
+
+    X = cluster_data[:, :-1]
+    y = cluster_data[:, -1]
+
+    X = X.reshape(X.shape[0], X.shape[1], 1)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    model = Sequential([
+        Input(shape=(X_train.shape[1], 1)),
+        LSTM(64, return_sequences=True),
+        Dropout(0.3),
+        LSTM(32),
+        Dense(1)
+    ])
+
+    model.compile(
+        optimizer="adam",
+        loss="mse",
+        metrics=["mae"]
+    )
+
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        patience=6,
+        restore_best_weights=True
+    )
+
+    history = model.fit(
+        X_train, y_train,
+        epochs=60,
+        batch_size=32,
+        validation_split=0.2,
+        callbacks=[early_stop],
+        verbose=1
+    )
+
+    # Regression Evaluation
+    y_pred = model.predict(X_test)
+
+    mse = mean_squared_error(y_test, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    print("MSE :", round(mse,3))
+    print("RMSE:", round(rmse,3))
+    print("MAE :", round(mae,3))
+    print("R2  :", round(r2,3))
+
+    # Convert to Classification
+    threshold = np.median(y_test)
+    y_test_class = (y_test > threshold).astype(int)
+    y_pred_class = (y_pred.flatten() > threshold).astype(int)
+
+    acc = accuracy_score(y_test_class, y_pred_class)
+    cm = confusion_matrix(y_test_class, y_pred_class)
+
+    print("Accuracy:", round(acc,3))
+    print("Confusion Matrix:\n", cm)
+
+    cluster_models[cluster] = model
+    cluster_metrics[cluster] = {
+        "accuracy": acc,
+        "confusion_matrix": cm,
+        "r2": r2
+    }
+
+
+# =====================================
+# 10. GLOBAL FUTURE PREDICTION
+# =====================================
+X_all = churn_scaled[:, :-1].reshape(churn_scaled.shape[0], -1, 1)
+
+# Use high-risk cluster model for prediction
+if high_risk_cluster in cluster_models:
+    global_model = cluster_models[high_risk_cluster]
+else:
+    global_model = list(cluster_models.values())[0]
+
+future_pred_scaled = global_model.predict(X_all)
+
+def inverse_scale(y_scaled):
+    dummy = np.zeros((len(y_scaled), churn_matrix.shape[1]))
+    dummy[:, -1] = y_scaled.flatten()
+    return scaler.inverse_transform(dummy)[:, -1]
+
+future_pred = inverse_scale(future_pred_scaled)
+
+df["predicted_next_churn"] = future_pred
+
+
+# =====================================
+# 11. HYBRID RISK SCORE
+# =====================================
+df["hybrid_risk_score"] = (
+    df["churn_probability"] *
+    np.maximum(df["predicted_next_churn"], 0)
+)
+
+df["churn_risk_level"] = pd.cut(
+    df["hybrid_risk_score"],
+    bins=[-1, 1, 5, np.inf],
+    labels=["LOW", "MEDIUM", "HIGH"]
+)
+
+# =====================================
+# 12. PARETO ANALYSIS (20% → 80% Rule)
+# =====================================
+
+# Sort by highest hybrid risk
+df_pareto = df.sort_values("hybrid_risk_score", ascending=False).reset_index()
+
+# Cumulative churn
+df_pareto["cumulative_churn"] = df_pareto["hybrid_risk_score"].cumsum()
+
+total_risk = df_pareto["hybrid_risk_score"].sum()
+
+df_pareto["cumulative_percent"] = (
+    df_pareto["cumulative_churn"] / total_risk * 100
+)
+
+# Flag top 80% churn contributors
+df_pareto["pareto_80_flag"] = df_pareto["cumulative_percent"] <= 80
+
+# Mark top 20% highest-risk sites
+top_20_cutoff = int(len(df_pareto) * 0.2)
+
+df_pareto["top_20_percent_flag"] = False
+df_pareto.loc[:top_20_cutoff-1, "top_20_percent_flag"] = True
+
+# Merge back to original dataframe
+df["pareto_80_flag"] = False
+df["top_20_percent_flag"] = False
+
+df.loc[df_pareto["index"], "pareto_80_flag"] = df_pareto["pareto_80_flag"].values
+df.loc[df_pareto["index"], "top_20_percent_flag"] = df_pareto["top_20_percent_flag"].values
+
+print("\n===== PARETO SUMMARY =====")
+print("Total Sites:", len(df))
+print("Top 20% Sites:", top_20_cutoff)
+print("Sites driving 80% churn:",
+      df["pareto_80_flag"].sum())
+
+
+
+# =====================================
+# 12. SAVE OUTPUT
+# =====================================
+df.to_excel("GRID_Churn_EM_LSTM_ClusterWise_Output.xlsx", index=False)
+
+print("\n===== HYBRID MODEL COMPLETE =====")
+print("Saved as GRID_Churn_EM_LSTM_ClusterWise_Output.xlsx")
+
